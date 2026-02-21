@@ -1,0 +1,907 @@
+/*******************************************************************************
+* REFRIGERATOR PRICE PREDICTION APPLICATION
+*******************************************************************************/
+
+PROC DATASETS LIBRARY=WORK KILL NOLIST; RUN; QUIT;
+
+OPTIONS MPRINT SYMBOLGEN MLOGIC;
+
+/* Define output path for SAS Studio */
+%LET home_path = /home/u64207754;
+
+TITLE "Data Import: Creating SAS datasets from input files";
+TITLE2 "Import CSV: refrigerators_price_prediction_with_duplicates_complet.csv";
+
+proc import datafile="&home_path./refrigerators_price_prediction_with_duplicates_complet.csv"
+    out=work.refrigerators_raw_import
+    dbms=csv
+    replace;
+    guessingrows=32767;
+run;
+
+TITLE3 "First 10 records from the imported dataset";
+PROC PRINT DATA=work.refrigerators_raw_import(OBS=10) NOOBS;
+    VAR id manufacturer price rating total_net_volume energy_class;
+RUN;
+
+/*******************************************************************************
+* Duplicate Detection and Handling
+*******************************************************************************/
+TITLE "Duplicate Detection and Handling";
+TITLE2 "Duplicates will be excluded from TRAIN and retained in TEST";
+
+DATA work.refrigerators_with_order;
+    SET work.refrigerators_raw_import;
+    _orig_order_ = _N_;
+RUN;
+
+PROC SORT DATA=work.refrigerators_with_order OUT=work.refrigerators_sorted_by_id;
+    BY id;
+RUN;
+
+DATA work.refrigerators_marked;
+    SET work.refrigerators_sorted_by_id;
+    BY id;
+    IF FIRST.id THEN is_duplicate = 0;
+    ELSE is_duplicate = 1;
+RUN;
+
+PROC SORT DATA=work.refrigerators_marked OUT=work.refrigerators_raw;
+    BY _orig_order_;
+RUN;
+
+TITLE3 "Duplicate identification report (original order restored)";
+PROC SQL;
+    SELECT 'Total records' AS Description, COUNT(*) AS N FROM work.refrigerators_raw
+    UNION ALL
+    SELECT 'Unique records (first.id)' AS Description, COUNT(*) AS N FROM work.refrigerators_raw WHERE is_duplicate = 0
+    UNION ALL
+    SELECT 'Duplicates identified' AS Description, COUNT(*) AS N FROM work.refrigerators_raw WHERE is_duplicate = 1;
+QUIT;
+
+/*******************************************************************************
+* Removing Incorrect Records
+*******************************************************************************/
+TITLE "Removing Incorrect Records";
+TITLE2 "IF...THEN DELETE to remove anomalies (price < 95)";
+
+DATA work.refrigerators;
+    SET work.refrigerators_raw;
+    IF price < 95 THEN DELETE; 
+run;
+
+TITLE3 "Result after DELETE";
+PROC SQL;
+    SELECT 'Before DELETE' AS Stage, COUNT(*) AS N FROM work.refrigerators_raw
+    UNION ALL
+    SELECT 'After DELETE (price<95)' AS Stage, COUNT(*) AS N FROM work.refrigerators;
+QUIT;
+
+TITLE "Dataset structure after cleaning (PROC CONTENTS)";
+TITLE2 "Variable list and attributes";
+PROC CONTENTS DATA=work.refrigerators; RUN;
+
+/*******************************************************************************
+* Descriptive Statistics
+*******************************************************************************/
+TITLE "Descriptive Statistics - Data Aggregation";
+TITLE2 "PROC MEANS: N, NMISS, MEAN, STD, MIN, MAX";
+
+PROC MEANS DATA=work.refrigerators N NMISS MEAN STD MIN MAX;
+    VAR price rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height;
+RUN;
+
+/*******************************************************************************
+* LABEL ENCODING FOR ENERGY CLASS
+*******************************************************************************/
+
+DATA work.refrigerators_encoded;
+    SET work.refrigerators;
+    
+    SELECT(energy_class);
+        WHEN('A+++') energy_class_encoded = 9;
+        WHEN('A++')  energy_class_encoded = 8;
+        WHEN('A+')   energy_class_encoded = 7;
+        WHEN('A')    energy_class_encoded = 6;
+        WHEN('B')    energy_class_encoded = 5;
+        WHEN('C')    energy_class_encoded = 4;
+        WHEN('D')    energy_class_encoded = 3;
+        OTHERWISE    energy_class_encoded = 2;
+    END;
+    
+    IF MISSING(manufacturer) THEN manufacturer = 'Unknown';
+    manufacturer = UPCASE(manufacturer);
+RUN;
+
+/*******************************************************************************
+* SQL Aggregation: Brand Statistics
+*******************************************************************************/
+TITLE "SQL Aggregation: Brand Statistics";
+TITLE2 "SELECT, FROM, WHERE, GROUP BY - aggregate functions";
+
+PROC SQL;
+    CREATE TABLE work.brand_stats AS
+    SELECT manufacturer, 
+           COUNT(*) AS product_count,
+           MEAN(price) AS avg_price FORMAT=COMMA10.2,
+           MEAN(LOG(price)) AS brand_avg_price
+    FROM work.refrigerators_encoded
+    WHERE price > 0
+    GROUP BY manufacturer
+    ORDER BY avg_price DESC;
+QUIT;
+
+TITLE3 "PROC SQL result: Statistics by manufacturer";
+PROC PRINT DATA=work.brand_stats(OBS=15) NOOBS;
+    VAR manufacturer product_count avg_price;
+RUN;
+
+PROC FASTCLUS DATA=work.brand_stats MAXCLUSTERS=3 OUT=work.brand_clusters NOPRINT;
+    VAR brand_avg_price;
+RUN;
+
+/*******************************************************************************
+* Dataset Merging via SQL JOIN
+*******************************************************************************/
+TITLE "Dataset Merging via SQL JOIN";
+TITLE2 "SQL LEFT JOIN to combine two tables";
+
+PROC SQL;
+    CREATE TABLE work.refrigerators_enhanced AS
+    SELECT t1.*, 
+           COALESCE(t2.brand_avg_price, 6.5) as brand_avg_price,
+           COALESCE(t2.CLUSTER, 2) as market_segment
+    FROM work.refrigerators_encoded t1
+    LEFT JOIN work.brand_clusters t2 ON t1.manufacturer = t2.manufacturer;
+QUIT;
+
+TITLE3 "LEFT JOIN result: First 10 combined records";
+PROC PRINT DATA=work.refrigerators_enhanced(OBS=10) NOOBS;
+    VAR manufacturer price brand_avg_price market_segment;
+RUN;
+
+/*******************************************************************************
+* One-Hot Encoding for Manufacturer
+*******************************************************************************/
+TITLE "One-Hot Encoding for Manufacturer";
+TITLE2 "Transform categorical variable into binary variables (0/1)";
+
+DATA work.refrigerators_ohe;
+    SET work.refrigerators_enhanced;
+    
+    manufacturer_Arctic = (UPCASE(manufacturer) = 'ARCTIC');
+    manufacturer_Beko = (UPCASE(manufacturer) = 'BEKO');
+    manufacturer_Bosch = (UPCASE(manufacturer) = 'BOSCH');
+    manufacturer_Gorenje = (UPCASE(manufacturer) = 'GORENJE');
+    manufacturer_Haier = (UPCASE(manufacturer) = 'HAIER');
+    manufacturer_Heinner = (UPCASE(manufacturer) = 'HEINNER');
+    manufacturer_Hisense = (UPCASE(manufacturer) = 'HISENSE');
+    manufacturer_LG = (UPCASE(manufacturer) = 'LG');
+    manufacturer_Liebherr = (UPCASE(manufacturer) = 'LIEBHERR');
+    manufacturer_Samsung = (UPCASE(manufacturer) = 'SAMSUNG');
+    manufacturer_Siemens = (UPCASE(manufacturer) = 'SIEMENS');
+    manufacturer_Teka = (UPCASE(manufacturer) = 'TEKA');
+    manufacturer_Whirlpool = (UPCASE(manufacturer) = 'WHIRLPOOL');
+    manufacturer_Zanussi = (UPCASE(manufacturer) = 'ZANUSSI');
+    manufacturer_Other = (UPCASE(manufacturer) NOT IN ('ARCTIC', 'BEKO', 'BOSCH', 
+        'GORENJE', 'HAIER', 'HEINNER', 'HISENSE', 'LG', 'LIEBHERR', 'SAMSUNG', 
+        'SIEMENS', 'TEKA', 'WHIRLPOOL', 'ZANUSSI'));
+RUN;
+
+TITLE3 "One-Hot Encoding result: First 10 records";
+PROC PRINT DATA=work.refrigerators_ohe(OBS=10) NOOBS;
+    VAR manufacturer manufacturer_Arctic manufacturer_Beko manufacturer_Bosch 
+        manufacturer_LG manufacturer_Samsung manufacturer_Other;
+RUN;
+
+/*******************************************************************************
+* HANDLE MISSING VALUES
+*******************************************************************************/
+
+DATA work.refrigerators_imputed;
+    SET work.refrigerators_ohe;
+    
+    IF MISSING(rating) THEN rating = 0;
+    IF MISSING(number_of_reviews) THEN number_of_reviews = 0;
+    IF MISSING(total_net_volume) THEN total_net_volume = 200;
+    IF MISSING(fridge_net_volume) THEN fridge_net_volume = 150;
+    IF MISSING(annual_energy_consumption) THEN annual_energy_consumption = 200;
+    IF MISSING(daily_energy_consumption) THEN daily_energy_consumption = 0.5;
+    IF MISSING(height) THEN height = 150;
+    
+    IF price > 0 THEN log_price = LOG(price);
+    ELSE log_price = .;
+RUN;
+
+/*******************************************************************************
+* PRICE SEGMENTATION & OUTLIER SEPARATION
+*******************************************************************************/
+
+PROC UNIVARIATE DATA=work.refrigerators_imputed NOPRINT;
+    VAR price;
+    OUTPUT OUT=price_stats 
+        MEAN=mean_price STD=std_price
+        Q1=q1_price Q3=q3_price
+        P5=p5_price P95=p95_price;
+RUN;
+
+DATA _NULL_;
+    SET price_stats;
+    CALL SYMPUTX('MEAN_PRICE', mean_price);
+    CALL SYMPUTX('STD_PRICE', std_price);
+    CALL SYMPUTX('Q1_PRICE', q1_price);
+    CALL SYMPUTX('Q3_PRICE', q3_price);
+    IQR = q3_price - q1_price;
+    CALL SYMPUTX('LOWER_FENCE', q1_price - 1.5*IQR);
+    CALL SYMPUTX('UPPER_FENCE', q3_price + 1.5*IQR);
+RUN;
+
+DATA work.refrigerators_final work.outliers_dataset;
+    SET work.refrigerators_imputed;
+    
+    IF price < 95 OR price > &UPPER_FENCE THEN is_outlier = 1;
+    ELSE is_outlier = 0;
+    
+    LENGTH price_category $10;
+    IF price <= 400 THEN DO;
+        price_category = 'LOW';
+        price_segment_enc = 1;
+    END;
+    ELSE IF price <= 1200 THEN DO;
+        price_category = 'MEDIUM';
+        price_segment_enc = 2;
+    END;
+    ELSE DO;
+        price_category = 'HIGH';
+        price_segment_enc = 3;
+    END;
+    
+    IF is_outlier = 1 THEN OUTPUT work.outliers_dataset;
+    ELSE OUTPUT work.refrigerators_final;
+RUN;
+
+TITLE "Price segment distribution (outliers excluded)";
+PROC FREQ DATA=work.refrigerators_final;
+    TABLES price_category / NOCUM;
+RUN;
+
+TITLE "Identified outliers (treated separately)";
+PROC MEANS DATA=work.outliers_dataset N MEAN MIN MAX;
+    VAR price;
+RUN;
+
+/*******************************************************************************
+* FEATURE ENGINEERING
+*******************************************************************************/
+
+DATA work.refrigerators_poly;
+    SET work.refrigerators_final;
+    
+    RETAIN is_minibar is_luxury density_metric brand_volume_power fridge_to_total_ratio 
+           energy_per_volume volume_per_height log_volume 0;
+           
+    is_minibar=0; is_luxury=0; density_metric=0; brand_volume_power=0;
+    fridge_to_total_ratio=0; energy_per_volume=0; volume_per_height=0; log_volume=0;
+
+    total_net_volume_sq = total_net_volume ** 2;
+    fridge_net_volume_sq = fridge_net_volume ** 2;
+    height_sq = height ** 2;
+    energy_class_sq = energy_class_encoded ** 2;
+    
+    volume_height = total_net_volume * height;
+    volume_energy = total_net_volume * energy_class_encoded;
+    fridge_height = fridge_net_volume * height;
+    energy_height = energy_class_encoded * height;
+    rating_reviews = rating * number_of_reviews;
+    
+    brand_volume_power = brand_avg_price * total_net_volume;
+    if total_net_volume < 120 then is_minibar = 1;
+    if price > 4000 then is_luxury = 1;
+    if total_net_volume > 0 then density_metric = annual_energy_consumption / total_net_volume;
+    
+    IF total_net_volume > 0 THEN fridge_to_total_ratio = fridge_net_volume / total_net_volume;
+    IF total_net_volume > 0 THEN energy_per_volume = annual_energy_consumption / total_net_volume;
+    IF height > 0 THEN volume_per_height = total_net_volume / height;
+    IF total_net_volume > 0 THEN log_volume = LOG(total_net_volume);
+    
+    premium_volume = stainless_steel * total_net_volume;
+    water_energy = water_dispenser * energy_class_encoded;
+    manufacturer_premium = (manufacturer_Liebherr + manufacturer_Bosch + manufacturer_Siemens) * energy_class_encoded;
+    
+    energy_efficiency = energy_class_encoded * (1 / (daily_energy_consumption + 0.01));
+    volume_rating = total_net_volume * rating;
+    
+    IF total_net_volume >= 350 THEN flag_large_capacity = 1; ELSE flag_large_capacity = 0;
+    IF manufacturer_Liebherr = 1 OR manufacturer_Bosch = 1 OR manufacturer_Siemens = 1 THEN flag_premium_brand = 1; ELSE flag_premium_brand = 0;
+    IF energy_class_encoded >= 6 THEN flag_high_efficiency = 1; ELSE flag_high_efficiency = 0;
+    IF stainless_steel = 1 OR dark_stainless_steel = 1 THEN flag_premium_finish = 1; ELSE flag_premium_finish = 0;
+    IF water_dispenser = 1 AND double_door = 1 THEN flag_modern_combo = 1; ELSE flag_modern_combo = 0;
+    IF total_net_volume < 200 AND water_dispenser = 0 AND double_door = 0 THEN flag_budget_segment = 1; ELSE flag_budget_segment = 0;
+RUN;
+
+/*******************************************************************************
+* STANDARDIZATION & SPLIT
+*******************************************************************************/
+
+PROC STDIZE DATA=work.refrigerators_poly OUT=work.refrigerators_scaled METHOD=STD;
+    VAR rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        total_net_volume_sq fridge_net_volume_sq height_sq energy_class_sq
+        volume_height volume_energy fridge_height energy_height rating_reviews
+        fridge_to_total_ratio energy_per_volume volume_per_height
+        log_volume premium_volume water_energy manufacturer_premium
+        energy_efficiency volume_rating 
+        brand_avg_price brand_volume_power density_metric
+        flag_large_capacity flag_premium_brand flag_high_efficiency 
+        flag_premium_finish flag_modern_combo flag_budget_segment 
+        is_minibar is_luxury market_segment price_segment_enc;
+RUN;
+
+DATA work.refrigerators_split;
+    SET work.refrigerators_scaled;
+    CALL STREAMINIT(42);
+    random_num = RAND('UNIFORM');
+RUN;
+
+DATA work.train_data work.test_data;
+    SET work.refrigerators_split;
+    IF is_duplicate = 1 THEN OUTPUT work.test_data;
+    ELSE DO;
+        IF random_num <= 0.8 THEN OUTPUT work.train_data;
+        ELSE OUTPUT work.test_data;
+    END;
+RUN;
+
+TITLE "Duplicate Handling: Data distribution after excluding duplicates from training";
+PROC SQL;
+    SELECT 'Training (without duplicates)' AS Dataset, COUNT(*) AS N FROM work.train_data
+    UNION ALL
+    SELECT 'Test (includes duplicates)' AS Dataset, COUNT(*) AS N FROM work.test_data
+    UNION ALL
+    SELECT '  - of which duplicates' AS Dataset, COUNT(*) AS N FROM work.test_data WHERE is_duplicate = 1;
+QUIT;
+
+DATA work.combined_for_scoring;
+    SET work.train_data(IN=in_train) work.test_data(IN=in_test);
+    IF in_train THEN subset_flag = 1;
+    ELSE DO;
+        subset_flag = 2;
+        price = .;
+        log_price = .; 
+    END;
+RUN;
+
+/*******************************************************************************
+* LINEAR REGRESSION
+*******************************************************************************/
+
+TITLE "Linear Regression";
+
+PROC REG DATA=work.train_data OUTEST=work.reg_estimates;
+    MODEL log_price = rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser
+        white silver stainless_steel dark_stainless_steel metal_look
+        manufacturer_Arctic manufacturer_Beko manufacturer_Bosch manufacturer_Gorenje
+        manufacturer_Haier manufacturer_Heinner manufacturer_Hisense manufacturer_LG
+        manufacturer_Liebherr manufacturer_Samsung manufacturer_Siemens manufacturer_Teka
+        manufacturer_Whirlpool manufacturer_Zanussi manufacturer_Other
+        / VIF;
+    OUTPUT OUT=work.reg_predictions P=pred_log_price R=residual;
+QUIT;
+
+PROC SCORE DATA=work.test_data SCORE=work.reg_estimates OUT=work.lr_test_pred TYPE=parms;
+    VAR rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser
+        white silver stainless_steel dark_stainless_steel metal_look
+        manufacturer_Arctic manufacturer_Beko manufacturer_Bosch manufacturer_Gorenje
+        manufacturer_Haier manufacturer_Heinner manufacturer_Hisense manufacturer_LG
+        manufacturer_Liebherr manufacturer_Samsung manufacturer_Siemens manufacturer_Teka
+        manufacturer_Whirlpool manufacturer_Zanussi manufacturer_Other;
+RUN;
+
+/*******************************************************************************
+* RIDGE REGRESSION
+*******************************************************************************/
+
+TITLE "Ridge Regression (via GLMSELECT L2=1)";
+
+PROC GLMSELECT DATA=work.train_data PLOTS=COEFFICIENTS SEED=42;
+    MODEL log_price = rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser
+        / SELECTION=ELASTICNET(CHOOSE=CV STOP=CV L2=1) CVMETHOD=RANDOM(10);
+    SCORE DATA=work.test_data OUT=work.ridge_test_pred P=pred_log_price_ridge;
+RUN;
+
+/*******************************************************************************
+* LASSO REGRESSION
+*******************************************************************************/
+
+TITLE "Lasso Regression";
+
+PROC GLMSELECT DATA=work.train_data PLOTS=COEFFICIENTS SEED=42;
+    CLASS manufacturer;
+    MODEL log_price = rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser manufacturer
+        / SELECTION=LASSO(CHOOSE=CV STOP=CV) CVMETHOD=RANDOM(10);
+    SCORE DATA=work.test_data OUT=work.lasso_test_pred P=pred_log_price_lasso;
+RUN;
+
+/*******************************************************************************
+* ELASTIC NET
+*******************************************************************************/
+
+TITLE "Elastic Net Regression";
+
+PROC GLMSELECT DATA=work.train_data PLOTS=COEFFICIENTS SEED=42;
+    CLASS manufacturer;
+    MODEL log_price = rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser manufacturer
+        / SELECTION=ELASTICNET(CHOOSE=CV STOP=CV L2=0.5) CVMETHOD=RANDOM(10);
+    SCORE DATA=work.test_data OUT=work.elasticnet_test_pred P=pred_log_price_elasticnet;
+RUN;
+
+/*******************************************************************************
+* DECISION TREE
+*******************************************************************************/
+
+TITLE "Decision Tree";
+
+PROC HPSPLIT DATA=work.train_data CVMETHOD=RANDOM(10) SEED=42;
+    CLASS manufacturer double_door single_door minibar reversible_doors water_dispenser;
+    MODEL log_price = rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        double_door single_door minibar reversible_doors water_dispenser manufacturer;
+    GROW VARIANCE;
+    PRUNE COSTCOMPLEXITY;
+    CODE FILE="%sysfunc(getoption(WORK))/dt_code.sas";
+RUN;
+
+DATA work.dt_test_pred;
+    SET work.test_data;
+    %INCLUDE "%sysfunc(getoption(WORK))/dt_code.sas";
+RUN;
+
+/*******************************************************************************
+* RANDOM FOREST
+*******************************************************************************/
+
+TITLE "Random Forest (Max Power)";
+
+PROC HPFOREST DATA=work.combined_for_scoring SEED=42 MAXTREES=1500 VARS_TO_TRY=ALL LEAFSIZE=1 MAXDEPTH=35;
+    TARGET log_price / LEVEL=INTERVAL;
+    INPUT rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        total_net_volume_sq fridge_net_volume_sq height_sq energy_class_sq
+        volume_height volume_energy fridge_height energy_height rating_reviews
+        fridge_to_total_ratio energy_per_volume volume_per_height
+        log_volume premium_volume water_energy manufacturer_premium
+        energy_efficiency volume_rating brand_avg_price brand_volume_power
+        density_metric is_minibar is_luxury
+        flag_large_capacity flag_premium_brand flag_high_efficiency 
+        flag_premium_finish flag_modern_combo flag_budget_segment / LEVEL=INTERVAL;
+    INPUT double_door single_door minibar reversible_doors water_dispenser
+        white silver stainless_steel dark_stainless_steel metal_look
+        manufacturer_Arctic manufacturer_Beko manufacturer_Bosch manufacturer_Gorenje
+        manufacturer_Haier manufacturer_Heinner manufacturer_Hisense manufacturer_LG
+        manufacturer_Liebherr manufacturer_Samsung manufacturer_Siemens manufacturer_Teka
+        manufacturer_Whirlpool manufacturer_Zanussi manufacturer_Other
+        market_segment / LEVEL=NOMINAL;
+    ID subset_flag;
+    ODS OUTPUT VariableImportance=work.rf_importance FitStatistics=work.rf_fitstats;
+    SCORE OUT=work.rf_combined_pred;
+RUN;
+
+DATA work.rf_test_pred;
+    SET work.rf_combined_pred;
+    WHERE subset_flag = 2;
+RUN;
+
+/*******************************************************************************
+* RANDOM FOREST TUNED (Gradient Boosting Approximation)
+*******************************************************************************/
+
+TITLE "Random_Forest_Tuned (Gradient Boosting Approximation)";
+
+PROC HPFOREST DATA=work.combined_for_scoring SEED=42 MAXTREES=800 LEAFSIZE=2 MAXDEPTH=15 VARS_TO_TRY=ALL;
+    TARGET log_price / LEVEL=INTERVAL;
+    INPUT rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded
+        total_net_volume_sq fridge_net_volume_sq height_sq energy_class_sq
+        volume_height volume_energy fridge_height energy_height rating_reviews
+        fridge_to_total_ratio energy_per_volume volume_per_height
+        log_volume premium_volume water_energy manufacturer_premium
+        energy_efficiency volume_rating brand_avg_price brand_volume_power
+        density_metric is_minibar is_luxury
+        flag_large_capacity flag_premium_brand flag_high_efficiency 
+        flag_premium_finish flag_modern_combo flag_budget_segment / LEVEL=INTERVAL;
+    INPUT double_door single_door minibar reversible_doors water_dispenser
+        white silver stainless_steel dark_stainless_steel metal_look
+        manufacturer_Arctic manufacturer_Beko manufacturer_Bosch manufacturer_Gorenje
+        manufacturer_Haier manufacturer_Heinner manufacturer_Hisense manufacturer_LG
+        manufacturer_Liebherr manufacturer_Samsung manufacturer_Siemens manufacturer_Teka
+        manufacturer_Whirlpool manufacturer_Zanussi manufacturer_Other market_segment / LEVEL=NOMINAL;
+    ID subset_flag;
+    ODS OUTPUT VariableImportance=work.gb_importance FitStatistics=work.gb_fitstats;
+    SCORE OUT=work.gb_combined_pred;
+RUN;
+
+DATA work.gb_test_pred;
+    SET work.gb_combined_pred;
+    WHERE subset_flag = 2;
+RUN;
+
+/*******************************************************************************
+* NEURAL NETWORK
+*******************************************************************************/
+
+TITLE "Neural Network";
+
+PROC HPNEURAL DATA=work.train_data;
+    ARCHITECTURE MLP;
+    INPUT rating number_of_reviews total_net_volume fridge_net_volume 
+        annual_energy_consumption daily_energy_consumption height energy_class_encoded brand_avg_price is_minibar density_metric / LEVEL=INT;
+    INPUT double_door single_door minibar reversible_doors water_dispenser
+        white silver stainless_steel dark_stainless_steel metal_look
+        manufacturer_Arctic manufacturer_Beko manufacturer_Bosch manufacturer_Gorenje
+        manufacturer_Haier manufacturer_Heinner manufacturer_Hisense manufacturer_LG
+        manufacturer_Liebherr manufacturer_Samsung manufacturer_Siemens manufacturer_Teka
+        manufacturer_Whirlpool manufacturer_Zanussi manufacturer_Other market_segment / LEVEL=NOM;
+    TARGET log_price / LEVEL=INT;
+    HIDDEN 20;
+    HIDDEN 10;
+    HIDDEN 5;
+    TRAIN OUTMODEL=work.nn_model MAXITER=200;
+RUN;
+
+PROC HPNEURAL DATA=work.test_data;
+    SCORE OUT=work.nn_test_pred MODEL=work.nn_model;
+RUN;
+
+/*******************************************************************************
+* CALCULATE METRICS FROM ACTUAL PREDICTIONS
+*******************************************************************************/
+
+TITLE "Calculating Model Metrics from Actual Predictions";
+
+DATA work.model_comparison;
+    LENGTH Model $30;
+    FORMAT R2 R2_Log 6.4 MAE RMSE 10.2 MAPE 6.2;
+    STOP;
+RUN;
+
+/* Macro with simple back-transformation EXP() without smearing */
+%MACRO calc_metrics(data=, actual=, predicted=, model_name=);
+    PROC SQL NOPRINT;
+        SELECT AVG(&actual), AVG(LOG(&actual)) INTO :mean_y, :mean_log_y FROM &data WHERE &actual > 0;
+    QUIT;
+    PROC SQL NOPRINT;
+        SELECT 
+            AVG(ABS(&actual - &predicted)),
+            SQRT(AVG((&actual - &predicted)**2)),
+            1 - (SUM((&actual - &predicted)**2) / SUM((&actual - &mean_y)**2)),
+            1 - (SUM((LOG(&actual) - LOG(&predicted))**2) / SUM((LOG(&actual) - &mean_log_y)**2)),
+            AVG(ABS((&actual - &predicted) / CASE WHEN &actual = 0 THEN 0.000001 ELSE &actual END)) * 100
+        INTO :mae_val, :rmse_val, :r2_val, :r2_log_val, :mape_val
+        FROM &data
+        WHERE &predicted > 0 AND &actual > 0;
+    QUIT;
+    DATA work.new_row;
+        LENGTH Model $30;
+        Model = "&model_name";
+        MAE = &mae_val; RMSE = &rmse_val; R2 = &r2_val; R2_Log = &r2_log_val; MAPE = &mape_val;
+    RUN;
+    PROC APPEND BASE=work.model_comparison DATA=work.new_row FORCE; RUN;
+%MEND calc_metrics;
+
+/* CALCULATE ALL METRICS - SIMPLE BACK-TRANSFORMATION EXP() */
+
+DATA work.lr_test_metrics; SET work.lr_test_pred; 
+    IF NOT MISSING(MODEL1) THEN pred_price = EXP(MODEL1); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.lr_test_metrics, actual=price, predicted=pred_price, model_name=Linear_Regression);
+
+DATA work.lasso_metrics; MERGE work.lasso_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(pred_log_price_lasso) THEN pred_price = EXP(pred_log_price_lasso); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.lasso_metrics, actual=price, predicted=pred_price, model_name=Lasso);
+
+DATA work.elasticnet_metrics; MERGE work.elasticnet_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(pred_log_price_elasticnet) THEN pred_price = EXP(pred_log_price_elasticnet); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.elasticnet_metrics, actual=price, predicted=pred_price, model_name=ElasticNet);
+
+DATA work.dt_metrics; MERGE work.dt_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(P_log_price) THEN pred_price = EXP(P_log_price); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.dt_metrics, actual=price, predicted=pred_price, model_name=Decision_Tree);
+
+DATA work.ridge_metrics; MERGE work.ridge_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(pred_log_price_ridge) THEN pred_price = EXP(pred_log_price_ridge); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.ridge_metrics, actual=price, predicted=pred_price, model_name=Ridge);
+
+DATA work.rf_metrics; MERGE work.rf_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(P_log_price) THEN pred_price = EXP(P_log_price); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.rf_metrics, actual=price, predicted=pred_price, model_name=Random_Forest);
+
+DATA work.gb_metrics; MERGE work.gb_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(P_log_price) THEN pred_price = EXP(P_log_price); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.gb_metrics, actual=price, predicted=pred_price, model_name=Random_Forest_Tuned);
+
+DATA work.nn_metrics; MERGE work.nn_test_pred work.test_data(KEEP=price price_category); 
+    IF NOT MISSING(P_log_price) THEN pred_price = EXP(P_log_price); 
+    ELSE pred_price = .; 
+RUN;
+%calc_metrics(data=work.nn_metrics, actual=price, predicted=pred_price, model_name=Neural_Network);
+
+PROC SORT DATA=work.model_comparison; BY DESCENDING R2; RUN;
+
+/*******************************************************************************
+* ANALYTICS & EXPORTS
+*******************************************************************************/
+
+TITLE "Statistical Analysis";
+PROC REG DATA=work.train_data;
+    MODEL log_price = total_net_volume fridge_net_volume height energy_class_encoded / DW DWPROB SPEC;
+    OUTPUT OUT=work.reg_residuals R=residual;
+QUIT;
+
+TITLE "Feature Importance (Random_Forest_Tuned)";
+PROC PRINT DATA=work.gb_importance; RUN;
+
+TITLE "Residual Plot";
+PROC SGPLOT DATA=work.reg_residuals;
+    SCATTER X=log_price Y=residual / MARKERATTRS=(SYMBOL=CIRCLEFILLED SIZE=3);
+    REFLINE 0 / AXIS=Y LINEATTRS=(COLOR=RED);
+    XAXIS LABEL="Log Price";
+    YAXIS LABEL="Residual";
+RUN;
+
+DATA _NULL_;
+    SET work.model_comparison(OBS=1);
+    CALL SYMPUTX('best_model', Model);
+    CALL SYMPUTX('best_r2', R2);
+RUN;
+
+TITLE "Predicting Prices for All Refrigerators using &best_model (Best Model: R²=&best_r2)";
+
+PROC EXPORT DATA=work.model_comparison
+    OUTFILE="&home_path./model_comparison_results.csv"
+    DBMS=CSV REPLACE;
+RUN;
+
+TITLE "=== REFRIGERATOR PRICE PREDICTION - FINAL SUMMARY ===";
+PROC PRINT DATA=work.model_comparison NOOBS;
+    TITLE2 "Model Performance Summary (Target: Low MAPE/RMSE)";
+    VAR Model R2 R2_Log MAE RMSE MAPE;
+    FORMAT R2 R2_Log MAPE 6.4 MAE RMSE 10.2;
+RUN;
+
+/*******************************************************************************
+* SEGMENTED METRICS ANALYSIS BY PRICE CATEGORY
+*******************************************************************************/
+
+TITLE "=== SEGMENTED METRICS ANALYSIS BY PRICE CATEGORY ===";
+TITLE2 "Thresholds: LOW (<=400 EUR), MEDIUM (401-1200 EUR), HIGH (>1200 EUR)";
+
+DATA work.segmented_analysis;
+    SET work.gb_metrics;
+    IF pred_price > 0 AND price > 0;
+    
+    LENGTH price_segment $25;
+    IF price <= 400 THEN DO;
+        price_segment = "1. LOW (<=400)";
+        segment_id = 1;
+    END;
+    ELSE IF price <= 1200 THEN DO;
+        price_segment = "2. MEDIUM (401-1200)";
+        segment_id = 2;
+    END;
+    ELSE DO;
+        price_segment = "3. HIGH (>1200)";
+        segment_id = 3;
+    END;
+    
+    abs_error = ABS(price - pred_price);
+    squared_error = (price - pred_price)**2;
+    IF price > 0 THEN pct_error = ABS((price - pred_price) / price) * 100;
+    ELSE pct_error = .;
+RUN;
+
+PROC SQL;
+    CREATE TABLE work.segmented_metrics AS
+    SELECT 
+        price_segment,
+        segment_id,
+        COUNT(*) AS N,
+        MIN(price) AS Min_Price FORMAT=COMMA10.2,
+        MAX(price) AS Max_Price FORMAT=COMMA10.2,
+        MEAN(price) AS Avg_Price FORMAT=COMMA10.2,
+        MEAN(abs_error) AS MAE FORMAT=10.2,
+        SQRT(MEAN(squared_error)) AS RMSE FORMAT=10.2,
+        MEAN(pct_error) AS MAPE FORMAT=6.2
+    FROM work.segmented_analysis
+    GROUP BY price_segment, segment_id
+    ORDER BY segment_id;
+QUIT;
+
+DATA work.segmented_metrics;
+    SET work.segmented_metrics;
+    LENGTH Rating $30;
+    
+    IF segment_id = 1 THEN DO;
+        IF MAE < 15 THEN Rating = "*** Very Good";
+        ELSE IF MAE < 25 THEN Rating = "** Good";
+        ELSE Rating = "* Needs improvement";
+    END;
+    ELSE IF segment_id = 2 THEN DO;
+        IF MAE < 35 THEN Rating = "*** Very Good";
+        ELSE IF MAE < 60 THEN Rating = "** Acceptable";
+        ELSE Rating = "* Needs improvement";
+    END;
+    ELSE DO;
+        IF MAPE < 5 THEN Rating = "*** Very Good";
+        ELSE IF MAPE < 10 THEN Rating = "** Acceptable";
+        ELSE Rating = "* Needs improvement";
+    END;
+RUN;
+
+TITLE2 "Model: Random_Forest_Tuned (Gradient Boosting Approximation)";
+PROC PRINT DATA=work.segmented_metrics NOOBS;
+    VAR price_segment N Min_Price Max_Price Avg_Price MAE RMSE MAPE Rating;
+RUN;
+
+TITLE "RMSE/MAE Ratio by Segment (Normal: 1.2-1.5, >1.5 = large outliers)";
+PROC SQL;
+    SELECT 
+        price_segment,
+        MAE FORMAT=10.2,
+        RMSE FORMAT=10.2,
+        RMSE/MAE AS RMSE_MAE_Ratio FORMAT=6.3,
+        CASE 
+            WHEN RMSE/MAE <= 1.2 THEN "Excellent - very stable"
+            WHEN RMSE/MAE <= 1.5 THEN "Normal - stable"
+            WHEN RMSE/MAE <= 2.0 THEN "Caution - some outliers"
+            ELSE "Problematic - large outliers"
+        END AS Stability LENGTH=30
+    FROM work.segmented_metrics;
+QUIT;
+
+/*******************************************************************************
+* SEPARATED OUTLIER ANALYSIS
+*******************************************************************************/
+
+TITLE "=== SEPARATED OUTLIER ANALYSIS ===";
+TITLE2 "These outliers were RETAINED separately, not deleted!";
+
+PROC MEANS DATA=work.outliers_dataset N MEAN STD MIN Q1 MEDIAN Q3 MAX;
+    VAR price total_net_volume height energy_class_encoded;
+RUN;
+
+TITLE "=== RESULTS INTERPRETATION ===";
+DATA _NULL_;
+    SET work.segmented_metrics END=last;
+    IF _N_ = 1 THEN DO;
+        PUT "============================================================";
+        PUT "OPTIMIZATIONS APPLIED:";
+        PUT "  1. Segmentation into 3 categories: LOW/MEDIUM/HIGH";
+        PUT "  2. Direct back-transformation EXP() (without smearing)";
+        PUT "  3. Outliers treated separately (not deleted)";
+        PUT "============================================================";
+    END;
+    PUT price_segment @35 "MAE=" MAE 8.2 " EUR | MAPE=" MAPE 5.2 "% | " Rating;
+    IF last THEN DO;
+        PUT "============================================================";
+        PUT " ";
+        PUT "Benchmarks legend (updated):";
+        PUT "  - LOW (<=400 EUR): MAE < 25 = good, < 15 = very good";
+        PUT "  - MEDIUM (401-1200 EUR): MAE < 60 = acceptable, < 35 = good";
+        PUT "  - HIGH (>1200 EUR): MAPE < 10% = acceptable, < 5% = good";
+    END;
+RUN;
+
+PROC EXPORT DATA=work.segmented_metrics
+    OUTFILE="&home_path./segmented_metrics_by_price.csv"
+    DBMS=CSV REPLACE;
+RUN;
+
+PROC EXPORT DATA=work.outliers_dataset
+    OUTFILE="&home_path./outliers_separated.csv"
+    DBMS=CSV REPLACE;
+RUN;
+
+TITLE;
+
+/*******************************************************************************
+* ACTUAL VS PREDICTED PRICES (WITH ERROR COLUMN)
+*******************************************************************************/
+
+DATA work.gb_combined_idx;
+    SET work.gb_combined_pred;
+    _idx_ = _N_;
+RUN;
+
+DATA work.all_data_idx;
+    SET work.refrigerators_final;
+    _idx_ = _N_;
+RUN;
+
+PROC SORT DATA=work.gb_combined_idx; BY _idx_; RUN;
+PROC SORT DATA=work.all_data_idx; BY _idx_; RUN;
+
+DATA work.gb_display_all;
+    MERGE work.gb_combined_idx(KEEP=P_log_price subset_flag _idx_)
+          work.all_data_idx(KEEP=id manufacturer price total_net_volume fridge_net_volume 
+                             height energy_class energy_class_encoded
+                             double_door water_dispenser stainless_steel 
+                             price_category _idx_);
+    BY _idx_;
+    
+    IF NOT MISSING(P_log_price) THEN pred_price = EXP(P_log_price);
+    ELSE pred_price = .;
+
+    IF NOT MISSING(pred_price) AND NOT MISSING(price) THEN DO;
+        abs_error_eur = ABS(price - pred_price);
+        pct_error = ABS((price - pred_price) / price) * 100;
+    END;
+    ELSE DO;
+        abs_error_eur = .;
+        pct_error = .;
+    END;
+    
+    LENGTH subset $10;
+    IF subset_flag = 1 THEN subset = "Train";
+    ELSE subset = "Test";
+RUN;
+
+DATA work.gb_display_sorted;
+    SET work.gb_display_all;
+    fridge_num = INPUT(SCAN(id, 2, '_'), 8.);
+RUN;
+
+PROC SORT DATA=work.gb_display_sorted; BY fridge_num; RUN;
+
+PROC PRINT DATA=work.gb_display_sorted NOOBS LABEL;
+    VAR id manufacturer price pred_price abs_error_eur pct_error
+        total_net_volume fridge_net_volume height energy_class 
+        double_door water_dispenser stainless_steel 
+        price_category subset;
+    FORMAT price pred_price abs_error_eur COMMA10.2 pct_error 6.2;
+    TITLE "Actual vs. Predicted Price - Random Forest Tuned (Gradient Boosting Approximation)";
+    TITLE2 "All Observations sorted by Product ID (FRIDGE_1 to FRIDGE_last)";
+    LABEL id = "Product ID"
+          price = "Actual Price (EUR)"
+          pred_price = "Predicted Price (EUR)"
+          abs_error_eur = "Error (EUR)"
+          pct_error = "Error (%)"
+          total_net_volume = "Total Volume (L)"
+          fridge_net_volume = "Fridge Volume (L)"
+          height = "Height (cm)"
+          energy_class = "Energy Class"
+          double_door = "Double Door"
+          water_dispenser = "Water Dispenser"
+          stainless_steel = "Stainless Steel"
+          manufacturer = "Manufacturer"
+          price_category = "Price Segment"
+          subset = "Dataset";
+RUN;
+
+PROC EXPORT DATA=work.gb_display_sorted
+    OUTFILE="&home_path./all_predictions_RF_Tuned.csv"
+    DBMS=CSV REPLACE;
+RUN;
